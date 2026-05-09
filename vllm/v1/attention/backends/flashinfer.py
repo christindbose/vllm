@@ -28,6 +28,14 @@ if TYPE_CHECKING:
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
 
+# Track A.1: opt-in path for the user's mech2 cascade kernel.
+# Set VLLM_MECH2_MODE=1 to enable mech2-fused cascade attention via the local
+# FlashInfer fork's MultiLevelCascadeAttentionWrapper. Default off so stock
+# cascade behavior is unchanged.
+import os as _os
+_MECH2_MODE = _os.environ.get("VLLM_MECH2_MODE", "0") == "1"
+del _os
+
 logger = init_logger(__name__)
 
 
@@ -316,7 +324,9 @@ class FlashInferMetadataBuilder:
             self.global_hyperparameters = infer_global_hyperparameters(
                 get_per_layer_parameters(self.vllm_config))
         if attn_metadata.use_cascade:
+            print(f"[SMOKE_TEST_CASCADE] plan: common_prefix_len={attn_metadata.shared_kv_last_page_len} mech2={_MECH2_MODE}", flush=True)
             attn_metadata.cascade_wrapper = self._get_cascade_wrapper()
+            _plan_extra_kwargs = {"mech2_mode": True} if _MECH2_MODE else {}
             attn_metadata.cascade_wrapper.plan(
                 [attn_metadata.shared_qo_indptr, attn_metadata.qo_indptr],
                 [
@@ -340,6 +350,7 @@ class FlashInferMetadataBuilder:
                 window_left=self.global_hyperparameters.window_left,
                 logits_soft_cap=self.global_hyperparameters.logits_soft_cap,
                 q_data_type=attn_metadata.q_data_type,
+                **_plan_extra_kwargs,
             )
         else:
             # Regular attention (common case).
@@ -593,8 +604,18 @@ class FlashInferImpl(AttentionImpl):
 
         if attn_metadata.use_cascade:
             # Cascade attention (rare case).
+            print(f"[SMOKE_TEST_CASCADE] run: query.shape={tuple(query.shape)} mech2={_MECH2_MODE}", flush=True)
             assert attn_metadata.cascade_wrapper is not None
-            output.copy_(attn_metadata.cascade_wrapper.run(query, kv_cache))
+            if _MECH2_MODE:
+                # Track A.1: the fork's fused 2-level path expects q packed as
+                # [q_for_level_0; q_for_level_1] of shape [2*N, H, D]. Both levels
+                # consume the same N queries here, so we just concatenate twice.
+                # The wrapper returns the merged result with shape [N, H, D].
+                q_packed = torch.cat([query, query], dim=0)
+                output.copy_(attn_metadata.cascade_wrapper.run(q_packed, kv_cache))
+            else:
+                # Legacy stock path: fork's baseline=True non-fused multi-pass merge.
+                output.copy_(attn_metadata.cascade_wrapper.run(query, kv_cache, baseline=True))
             return output
 
         num_decode_tokens = attn_metadata.num_decode_tokens
