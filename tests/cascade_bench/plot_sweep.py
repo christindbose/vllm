@@ -61,6 +61,12 @@ def main():
 
     for d in args.result_dirs:
         label = os.path.basename(d.rstrip("/"))
+        # Strip trailing experiment-tag suffixes (e.g. "_sat") so the legend
+        # shows backend names cleanly. Add more suffixes here as needed.
+        for suffix in ("_sat", "_v2", "_full"):
+            if label.endswith(suffix):
+                label = label[:-len(suffix)]
+                break
         runs = load_runs(d)
         if not runs:
             print(f"[plot] WARN: no JSONs in {d}", file=sys.stderr)
