@@ -28,12 +28,14 @@ if TYPE_CHECKING:
 
 FLASHINFER_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
 
-# Track A.1: opt-in path for the user's mech2 cascade kernel.
-# Set VLLM_MECH2_MODE=1 to enable mech2-fused cascade attention via the local
-# FlashInfer fork's MultiLevelCascadeAttentionWrapper. Default off so stock
-# cascade behavior is unchanged.
+# Track A.1: opt-in path that routes vLLM's 2-level cascade plan through the
+# local FlashInfer fork's tree-walk scheduling. Builds a parallel num_levels=1
+# wrapper with combined indptrs (cat of shared+suffix tensors), runs with
+# use_tree_walk_scheduling=True, q duplicated, and tree_nodes=[1, num_reqs].
+# Decode-only batches only (uniform 1-query-per-leaf assumption); other shapes
+# fall back to stock cascade. Default off so vLLM behavior is unchanged.
 import os as _os
-_MECH2_MODE = _os.environ.get("VLLM_MECH2_MODE", "0") == "1"
+_TREE_WALK_MODE = _os.environ.get("VLLM_TREE_WALK", "0") == "1"
 del _os
 
 logger = init_logger(__name__)
@@ -192,6 +194,11 @@ class FlashInferMetadata:
     prefill_wrapper: Optional[BatchPrefillWithPagedKVCacheWrapper] = None
     decode_wrapper: Optional[BatchDecodeWithPagedKVCacheWrapper] = None
     cascade_wrapper: Optional[MultiLevelCascadeAttentionWrapper] = None
+    # Track A.1 (decode-only tree-walk path); set when VLLM_TREE_WALK=1 and
+    # the batch is decode-only. When non-None, forward() routes cascade through
+    # this wrapper instead of cascade_wrapper.
+    tree_walk_wrapper: Optional[MultiLevelCascadeAttentionWrapper] = None
+    tree_walk_num_reqs: int = 0
 
     @property
     def query_start_loc(self):
@@ -218,6 +225,8 @@ class FlashInferMetadataBuilder:
         self._prefill_wrapper = None  # Wrapper for prefill/append
         self._decode_wrapper = None  # Wrapper for decode
         self._cascade_wrapper = None  # Wrapper for cascade attention
+        # Track A.1: separate num_levels=1 wrapper for the fork's tree-walk path.
+        self._tree_walk_wrapper = None
 
         # Global hyperparameters shared by all attention layers
         self.global_hyperparameters: Optional[PerLayerParameters] = None
@@ -319,39 +328,111 @@ class FlashInferMetadataBuilder:
                 2, self._get_workspace_buffer(), "NHD")
         return self._cascade_wrapper
 
+    def _get_tree_walk_wrapper(self):
+        # Track A.1: num_levels=1 wrapper used when VLLM_TREE_WALK=1 and the
+        # batch is decode-only. The full tree structure is encoded in a single
+        # combined qo_indptr (one indptr group per tree node).
+        if self._tree_walk_wrapper is None:
+            self._tree_walk_wrapper = MultiLevelCascadeAttentionWrapper(
+                1, self._get_workspace_buffer(), "NHD")
+        return self._tree_walk_wrapper
+
     def _plan(self, attn_metadata: FlashInferMetadata):
         if self.global_hyperparameters is None:
             self.global_hyperparameters = infer_global_hyperparameters(
                 get_per_layer_parameters(self.vllm_config))
         if attn_metadata.use_cascade:
-            print(f"[SMOKE_TEST_CASCADE] plan: common_prefix_len={attn_metadata.shared_kv_last_page_len} mech2={_MECH2_MODE}", flush=True)
-            attn_metadata.cascade_wrapper = self._get_cascade_wrapper()
-            _plan_extra_kwargs = {"mech2_mode": True} if _MECH2_MODE else {}
-            attn_metadata.cascade_wrapper.plan(
-                [attn_metadata.shared_qo_indptr, attn_metadata.qo_indptr],
-                [
-                    attn_metadata.shared_kv_page_indptr,
-                    attn_metadata.paged_kv_indptr
-                ],
-                [
+            # Track A.1: route through the fork's tree-walk path when
+            # (a) the env switch is set and (b) the batch is decode-only
+            # (the merge logic in cascade.py:run() assumes uniform 1-query-
+            # per-leaf, which only holds when every active req contributes
+            # exactly one query token to this step).
+            tree_walk_eligible = (_TREE_WALK_MODE
+                                  and attn_metadata.num_prefill_tokens == 0
+                                  and attn_metadata.num_decodes > 0)
+            if tree_walk_eligible:
+                # vLLM produces a 2-level cascade plan:
+                #   shared_qo_indptr      = [0, N]                       (1 shared group)
+                #   qo_indptr             = [0, q1, q1+q2, ..., N]       (num_reqs groups)
+                # The fork's tree-walk wrapper expects ONE indptr that encodes
+                # the full tree (1 root + num_reqs leaves). Concatenate, with
+                # the suffix indptr offset by N so token positions stay unique.
+                # Same for kv_page_indptr/indices/last_page_len.
+                shared_qo = attn_metadata.shared_qo_indptr      # [0, N]
+                shared_kv = attn_metadata.shared_kv_page_indptr  # [0, S]
+                # Use the last entry as the offset (kept on-device; no .item() sync).
+                n_offset = shared_qo[-1:]                        # tensor [N]
+                s_offset = shared_kv[-1:]                        # tensor [S]
+                combined_qo_indptr = torch.cat([
+                    shared_qo,
+                    attn_metadata.qo_indptr[1:] + n_offset,
+                ])
+                combined_kv_page_indptr = torch.cat([
+                    shared_kv,
+                    attn_metadata.paged_kv_indptr[1:] + s_offset,
+                ])
+                combined_kv_page_indices = torch.cat([
                     attn_metadata.shared_kv_page_indices,
-                    attn_metadata.paged_kv_indices
-                ],
-                [
+                    attn_metadata.paged_kv_indices,
+                ])
+                combined_kv_last_page_len = torch.cat([
                     attn_metadata.shared_kv_last_page_len,
-                    attn_metadata.paged_kv_last_page_len
-                ],
-                attn_metadata.num_qo_heads,
-                attn_metadata.num_kv_heads,
-                attn_metadata.head_dim,
-                attn_metadata.page_size,
-                causal=True,
-                sm_scale=self.global_hyperparameters.sm_scale,
-                window_left=self.global_hyperparameters.window_left,
-                logits_soft_cap=self.global_hyperparameters.logits_soft_cap,
-                q_data_type=attn_metadata.q_data_type,
-                **_plan_extra_kwargs,
-            )
+                    attn_metadata.paged_kv_last_page_len,
+                ])
+                attn_metadata.tree_walk_wrapper = self._get_tree_walk_wrapper()
+                attn_metadata.tree_walk_num_reqs = attn_metadata.num_decodes
+                print(f"[VLLM_TREE_WALK] plan: num_reqs={attn_metadata.num_decodes} "
+                      f"qo_indptr_len={combined_qo_indptr.shape[0]} "
+                      f"kv_pages={combined_kv_page_indices.shape[0]}", flush=True)
+                attn_metadata.tree_walk_wrapper.plan(
+                    [combined_qo_indptr],
+                    [combined_kv_page_indptr],
+                    [combined_kv_page_indices],
+                    [combined_kv_last_page_len],
+                    attn_metadata.num_qo_heads,
+                    attn_metadata.num_kv_heads,
+                    attn_metadata.head_dim,
+                    attn_metadata.page_size,
+                    causal=True,
+                    sm_scale=self.global_hyperparameters.sm_scale,
+                    window_left=self.global_hyperparameters.window_left,
+                    logits_soft_cap=self.global_hyperparameters.logits_soft_cap,
+                    q_data_type=attn_metadata.q_data_type,
+                    use_tree_walk_scheduling=True,
+                    kvsplit_mode=False,
+                    mech2_mode=False,
+                )
+            else:
+                # Stock 2-level cascade fallback. The fork's run() in
+                # baseline=True mode accepts vLLM's raw query layout.
+                print(f"[VLLM_CASCADE_FALLBACK] plan: prefill_tokens={attn_metadata.num_prefill_tokens} "
+                      f"decode_tokens={attn_metadata.num_decode_tokens} env_on={_TREE_WALK_MODE}",
+                      flush=True)
+                attn_metadata.cascade_wrapper = self._get_cascade_wrapper()
+                attn_metadata.cascade_wrapper.plan(
+                    [attn_metadata.shared_qo_indptr, attn_metadata.qo_indptr],
+                    [
+                        attn_metadata.shared_kv_page_indptr,
+                        attn_metadata.paged_kv_indptr
+                    ],
+                    [
+                        attn_metadata.shared_kv_page_indices,
+                        attn_metadata.paged_kv_indices
+                    ],
+                    [
+                        attn_metadata.shared_kv_last_page_len,
+                        attn_metadata.paged_kv_last_page_len
+                    ],
+                    attn_metadata.num_qo_heads,
+                    attn_metadata.num_kv_heads,
+                    attn_metadata.head_dim,
+                    attn_metadata.page_size,
+                    causal=True,
+                    sm_scale=self.global_hyperparameters.sm_scale,
+                    window_left=self.global_hyperparameters.window_left,
+                    logits_soft_cap=self.global_hyperparameters.logits_soft_cap,
+                    q_data_type=attn_metadata.q_data_type,
+                )
         else:
             # Regular attention (common case).
             # Decodes are at the front and prefills are at the back,
@@ -604,18 +685,23 @@ class FlashInferImpl(AttentionImpl):
 
         if attn_metadata.use_cascade:
             # Cascade attention (rare case).
-            print(f"[SMOKE_TEST_CASCADE] run: query.shape={tuple(query.shape)} mech2={_MECH2_MODE}", flush=True)
-            assert attn_metadata.cascade_wrapper is not None
-            if _MECH2_MODE:
-                # Track A.1: the fork's fused 2-level path expects q packed as
-                # [q_for_level_0; q_for_level_1] of shape [2*N, H, D]. Both levels
-                # consume the same N queries here, so we just concatenate twice.
-                # The wrapper returns the merged result with shape [N, H, D].
+            if attn_metadata.tree_walk_wrapper is not None:
+                # Track A.1 path: 1-level wrapper, q duplicated, tree merge.
+                # query is [N, H, D]; pack to [2N, H, D] (level-0 queries
+                # against shared kv, then level-1 queries against per-req kv).
                 q_packed = torch.cat([query, query], dim=0)
-                output.copy_(attn_metadata.cascade_wrapper.run(q_packed, kv_cache))
+                num_reqs = attn_metadata.tree_walk_num_reqs
+                print(f"[VLLM_TREE_WALK] run: query.shape={tuple(query.shape)} "
+                      f"num_reqs={num_reqs}", flush=True)
+                output.copy_(attn_metadata.tree_walk_wrapper.run(
+                    q_packed, kv_cache, tree_nodes=[1, num_reqs]))
             else:
-                # Legacy stock path: fork's baseline=True non-fused multi-pass merge.
-                output.copy_(attn_metadata.cascade_wrapper.run(query, kv_cache, baseline=True))
+                # Stock cascade path. The fork's run() with baseline=True
+                # uses the non-fused multi-pass merge that accepts vLLM's
+                # raw [N, H, D] query layout.
+                assert attn_metadata.cascade_wrapper is not None
+                output.copy_(attn_metadata.cascade_wrapper.run(
+                    query, kv_cache, baseline=True))
             return output
 
         num_decode_tokens = attn_metadata.num_decode_tokens
