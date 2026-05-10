@@ -36,6 +36,9 @@ FLASHINFER_WORKSPACE_BUFFER_SIZE = 256 * 1024 * 1024
 # fall back to stock cascade. Default off so vLLM behavior is unchanged.
 import os as _os
 _TREE_WALK_MODE = _os.environ.get("VLLM_TREE_WALK", "0") == "1"
+# Per-call diagnostic prints. Off by default (significant stdout overhead at
+# 1700+ cascade calls per generation). Set VLLM_TREE_WALK_DEBUG=1 to enable.
+_TREE_WALK_DEBUG = _os.environ.get("VLLM_TREE_WALK_DEBUG", "0") == "1"
 del _os
 
 logger = init_logger(__name__)
@@ -381,9 +384,10 @@ class FlashInferMetadataBuilder:
                 ])
                 attn_metadata.tree_walk_wrapper = self._get_tree_walk_wrapper()
                 attn_metadata.tree_walk_num_reqs = attn_metadata.num_decodes
-                print(f"[VLLM_TREE_WALK] plan: num_reqs={attn_metadata.num_decodes} "
-                      f"qo_indptr_len={combined_qo_indptr.shape[0]} "
-                      f"kv_pages={combined_kv_page_indices.shape[0]}", flush=True)
+                if _TREE_WALK_DEBUG:
+                    print(f"[VLLM_TREE_WALK] plan: num_reqs={attn_metadata.num_decodes} "
+                          f"qo_indptr_len={combined_qo_indptr.shape[0]} "
+                          f"kv_pages={combined_kv_page_indices.shape[0]}", flush=True)
                 attn_metadata.tree_walk_wrapper.plan(
                     [combined_qo_indptr],
                     [combined_kv_page_indptr],
@@ -405,9 +409,10 @@ class FlashInferMetadataBuilder:
             else:
                 # Stock 2-level cascade fallback. The fork's run() in
                 # baseline=True mode accepts vLLM's raw query layout.
-                print(f"[VLLM_CASCADE_FALLBACK] plan: prefill_tokens={attn_metadata.num_prefill_tokens} "
-                      f"decode_tokens={attn_metadata.num_decode_tokens} env_on={_TREE_WALK_MODE}",
-                      flush=True)
+                if _TREE_WALK_DEBUG:
+                    print(f"[VLLM_CASCADE_FALLBACK] plan: prefill_tokens={attn_metadata.num_prefill_tokens} "
+                          f"decode_tokens={attn_metadata.num_decode_tokens} env_on={_TREE_WALK_MODE}",
+                          flush=True)
                 attn_metadata.cascade_wrapper = self._get_cascade_wrapper()
                 attn_metadata.cascade_wrapper.plan(
                     [attn_metadata.shared_qo_indptr, attn_metadata.qo_indptr],
@@ -691,8 +696,9 @@ class FlashInferImpl(AttentionImpl):
                 # against shared kv, then level-1 queries against per-req kv).
                 q_packed = torch.cat([query, query], dim=0)
                 num_reqs = attn_metadata.tree_walk_num_reqs
-                print(f"[VLLM_TREE_WALK] run: query.shape={tuple(query.shape)} "
-                      f"num_reqs={num_reqs}", flush=True)
+                if _TREE_WALK_DEBUG:
+                    print(f"[VLLM_TREE_WALK] run: query.shape={tuple(query.shape)} "
+                          f"num_reqs={num_reqs}", flush=True)
                 output.copy_(attn_metadata.tree_walk_wrapper.run(
                     q_packed, kv_cache, tree_nodes=[1, num_reqs]))
             else:
