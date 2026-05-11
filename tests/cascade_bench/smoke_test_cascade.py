@@ -14,6 +14,8 @@ import os
 
 os.environ.setdefault("VLLM_USE_V1", "1")
 os.environ.setdefault("VLLM_ATTENTION_BACKEND", "FLASHINFER")
+# Silence OTel "ConnectionRefused" spam at localhost:4318 (no collector running)
+os.environ.setdefault("OTEL_SDK_DISABLED", "true")
 
 from vllm import LLM, SamplingParams
 
