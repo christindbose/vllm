@@ -1460,8 +1460,10 @@ class EngineArgs:
     def _set_default_args_v1(self, usage_context: UsageContext) -> None:
         """Set Default Arguments for V1 Engine."""
 
-        # V1 always uses chunked prefills.
-        self.enable_chunked_prefill = True
+        # V1 normally always uses chunked prefills, but allow caller override
+        # so we can compare against PAT-style atomic-prefill behavior.
+        if self.enable_chunked_prefill is None:
+            self.enable_chunked_prefill = True
 
         # V1 enables prefix caching by default.
         if self.enable_prefix_caching is None:
