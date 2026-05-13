@@ -385,9 +385,36 @@ class FlashInferMetadataBuilder:
                 attn_metadata.tree_walk_wrapper = self._get_tree_walk_wrapper()
                 attn_metadata.tree_walk_num_reqs = attn_metadata.num_decodes
                 if _TREE_WALK_DEBUG:
-                    print(f"[VLLM_TREE_WALK] plan: num_reqs={attn_metadata.num_decodes} "
+                    # Per-cascade-iteration shape stats.
+                    # shared_kv_page_indptr is [0, S_pages]; shared prefix length
+                    # is approximately S_pages * page_size (the shared chunk is
+                    # assumed page-aligned in vLLM's cascade build).
+                    page_size = attn_metadata.page_size
+                    shared_pages = int(attn_metadata.shared_kv_page_indptr[-1].item())
+                    shared_tokens = shared_pages * page_size
+                    # Per-request unique KV: derived from attn_metadata.paged_kv_indptr
+                    # deltas (in pages) plus paged_kv_last_page_len for each request.
+                    kv_indptr_cpu = attn_metadata.paged_kv_indptr.cpu()
+                    last_page_cpu = attn_metadata.paged_kv_last_page_len.cpu()
+                    n_reqs = int(attn_metadata.num_decodes)
+                    unique_tokens = []
+                    for i in range(n_reqs):
+                        npages = int(kv_indptr_cpu[i + 1].item() - kv_indptr_cpu[i].item())
+                        if npages == 0:
+                            unique_tokens.append(0)
+                        else:
+                            unique_tokens.append((npages - 1) * page_size +
+                                                  int(last_page_cpu[i].item()))
+                    u_total = sum(unique_tokens)
+                    u_min = min(unique_tokens) if unique_tokens else 0
+                    u_max = max(unique_tokens) if unique_tokens else 0
+                    u_med = sorted(unique_tokens)[len(unique_tokens) // 2] if unique_tokens else 0
+                    print(f"[VLLM_TREE_WALK] plan: num_reqs={n_reqs} "
+                          f"shared_tok={shared_tokens} ({shared_pages}p) "
+                          f"unique_tok total={u_total} min={u_min} med={u_med} max={u_max} "
                           f"qo_indptr_len={combined_qo_indptr.shape[0]} "
-                          f"kv_pages={combined_kv_page_indices.shape[0]}", flush=True)
+                          f"kv_pages={combined_kv_page_indices.shape[0]}",
+                          flush=True)
                 attn_metadata.tree_walk_wrapper.plan(
                     [combined_qo_indptr],
                     [combined_kv_page_indptr],
@@ -410,7 +437,29 @@ class FlashInferMetadataBuilder:
                 # Stock 2-level cascade fallback. The fork's run() in
                 # baseline=True mode accepts vLLM's raw query layout.
                 if _TREE_WALK_DEBUG:
-                    print(f"[VLLM_CASCADE_FALLBACK] plan: prefill_tokens={attn_metadata.num_prefill_tokens} "
+                    page_size = attn_metadata.page_size
+                    shared_pages = int(attn_metadata.shared_kv_page_indptr[-1].item())
+                    shared_tokens = shared_pages * page_size
+                    kv_indptr_cpu = attn_metadata.paged_kv_indptr.cpu()
+                    last_page_cpu = attn_metadata.paged_kv_last_page_len.cpu()
+                    # Number of requests = len(paged_kv_last_page_len)
+                    n_reqs = int(last_page_cpu.shape[0])
+                    unique_tokens = []
+                    for i in range(n_reqs):
+                        npages = int(kv_indptr_cpu[i + 1].item() - kv_indptr_cpu[i].item())
+                        if npages == 0:
+                            unique_tokens.append(0)
+                        else:
+                            unique_tokens.append((npages - 1) * page_size +
+                                                  int(last_page_cpu[i].item()))
+                    u_total = sum(unique_tokens)
+                    u_min = min(unique_tokens) if unique_tokens else 0
+                    u_max = max(unique_tokens) if unique_tokens else 0
+                    u_med = sorted(unique_tokens)[len(unique_tokens) // 2] if unique_tokens else 0
+                    print(f"[VLLM_CASCADE_FALLBACK] plan: num_reqs={n_reqs} "
+                          f"shared_tok={shared_tokens} ({shared_pages}p) "
+                          f"unique_tok total={u_total} min={u_min} med={u_med} max={u_max} "
+                          f"prefill_tokens={attn_metadata.num_prefill_tokens} "
                           f"decode_tokens={attn_metadata.num_decode_tokens} env_on={_TREE_WALK_MODE}",
                           flush=True)
                 attn_metadata.cascade_wrapper = self._get_cascade_wrapper()
