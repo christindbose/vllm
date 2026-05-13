@@ -403,7 +403,7 @@ class FlashInferMetadataBuilder:
                     logits_soft_cap=self.global_hyperparameters.logits_soft_cap,
                     q_data_type=attn_metadata.q_data_type,
                     use_tree_walk_scheduling=True,
-                    kvsplit_mode=False,
+                    kvsplit_mode=True,
                     mech2_mode=False,
                 )
             else:
